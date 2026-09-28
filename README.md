@@ -2,7 +2,11 @@
 
 This component contains the data ingestion, filtering, partitioning, and human-validation sampling pipeline for the **MARC (Multi-Agent Realignment and Correction)** framework.
 
-The raw corpus is derived from the **MAST-Data** benchmark ([Hugging Face: `mcemri/MAST-Data`](https://huggingface.co/datasets/mcemri/MAST-Data)), introduced by Cemri et al. (NeurIPS 2025 Spotlight).
+The raw corpus is derived from the **MAST-Data** benchmark ([Hugging Face: `mcemri/MAST-Data`](https://huggingface.co/datasets/mcemri/MAST-Data)), introduced by Cemri et al., *"Why Do Multi-Agent LLM Systems Fail?"* (NeurIPS 2025 Spotlight).
+
+**Status:** Preprocessing and dataset partitioning complete.
+
+Multi-Agent LLM Systems (MAS) suffer from high failure rates (41%–86.7%), driven predominantly by inter-agent misalignment (Category FC2 in the MAST taxonomy). This pipeline transforms the raw, multi-framework MAST-Data benchmark into a statistically controlled evaluation corpus that isolates three coordination failure modes: FM-2.3 (Task Derailment), FM-2.4 (Information Withholding), and FM-2.6 (Reasoning-Action Mismatch).
 
 ## Contents
 
@@ -13,7 +17,8 @@ The raw corpus is derived from the **MAST-Data** benchmark ([Hugging Face: `mcem
 5. [Schema Definitions](#5-schema-definitions)
 6. [Framework Support](#6-framework-support)
 7. [How to Reproduce](#7-how-to-reproduce)
-8. [Citation](#8-citation)
+8. [Terminology Glossary](#8-terminology-glossary)
+9. [Citation](#9-citation)
 
 ---
 
@@ -36,18 +41,42 @@ Running the preprocessing pipeline generates three primary artifacts:
 
 ## 2. Dataset Curation and Filtering
 
-### 2.1 Failure Mode Scoping
+### 2.1 Pipeline Overview
+
+The pipeline runs five sequential stages:
+
+```text
+Raw MAST-Data (1,642 traces)
+        │
+        ▼  [Stage 1: Scope Filtering & Noise Removal]
+Filtered Sub-Corpus (1,125 traces)
+        │
+        ▼  [Stage 2: Multi-Label Disambiguation (Priority Hierarchy)]
+Mutually Exclusive Primary Partitions
+(405 Clean | 24 FM-2.4 | 333 FM-2.3 | 363 FM-2.6)
+        │
+        ▼  [Stage 3: Trace-Level Stratified Partitioning (80/10/10)]
+Train (900) | Dev (112) | Test (113)
+        │
+        ▼  [Stage 4: Construct-Validity Sampling]
+Human-Validated Gold Standard (n = 64 traces)
+        │
+        ▼  [Stage 5: Lossless Artifact Serialization]
+JSONL datasets and human annotation workbook
+```
+
+### 2.2 Failure Mode Scoping
 
 The raw MAST-Data benchmark contains 1,642 execution traces spanning 14 discrete failure modes. MARC targets three high-impact, non-adversarial coordination failure modes within Category FC2 (Inter-Agent Misalignment):
 
 | Category | Failure Mode | Raw Traces | % of Raw Corpus | Note |
 |---|---|---:|---:|---|
-| Target | FM-2.3 Task Derailment | 353 | 21.50% | Agent output drifts from the original task specification |
-| Target | FM-2.4 Information Withholding | 24 | 1.46% | Near-exclusively fatal |
-| Target | FM-2.6 Reasoning-Action Mismatch | 610 | 37.15% | Most frequent coordination error |
+| Target | FM-2.3 Task Derailment | 353 | 21.50% | Agent output drifts from the original task specification (cumulative goal divergence) |
+| Target | FM-2.4 Information Withholding | 24 | 1.46% | Omission of goal-critical context; near-exclusively fatal |
+| Target | FM-2.6 Reasoning-Action Mismatch | 610 | 37.15% | Contradiction between internal reasoning and external action; most frequent coordination error |
 | Control | Clean (no failures) | 405 | 24.67% | Negative baseline for false positive rate (FPR) |
 
-### 2.2 Corpus Reduction Statistics
+### 2.3 Corpus Reduction Statistics
 
 Traces containing irrelevant system design issues (FC1) or terminal verification errors (FC3) were filtered out unless they co-occurred with target FC2 modes. Traces with no failures were preserved as negative controls.
 
@@ -60,15 +89,50 @@ Traces containing irrelevant system design issues (FC1) or terminal verification
 | FM-2.6 traces | 610 | 363 | 59.51% |
 | Data integrity | Raw strings | 100% text preserved | Zero truncation |
 
+### 2.4 Corpus Reconciliation and Rationale
+
+| Trace Category | Raw | Filtered | Net Change | Rationale |
+|---|---:|---:|---:|---|
+| Clean control traces | 405 | 405 | 0 | Mandatory negative controls for measuring FPR |
+| FM-2.4 (Information Withholding) | 24 | 24 | 0 | Exhaustively retained due to extreme fatality and scarcity |
+| FM-2.3 (Task Derailment) | 353 | 333 | −20 | 20 traces co-occurred with higher-priority FM-2.4 |
+| FM-2.6 (Reasoning-Action Mismatch) | 610 | 363 | −247 | Multi-label overlaps disambiguated; infrastructure-crash noise removed |
+| Non-target pure errors (FC1/FC3) | 517 | 0 | −517 | Pure infrastructure/syntax crashes unrelated to coordination |
+| **Total** | **1,642** | **1,125** | **−517** | 1,125 unique, non-overlapping traces |
+
+### 2.5 Multi-Label Disambiguation (Priority Hierarchy)
+
+In raw MAST-Data, annotations are multi-label: one trace can carry several failure modes and is double-counted in raw statistics. To evaluate detector precision without leakage, MARC enforces **mutually exclusive categorization** using a causal priority hierarchy:
+
+```text
+Priority 1: FM-2.4  ≻  Priority 2: FM-2.3  ≻  Priority 3: FM-2.6
+```
+
+- **Why FM-2.4 ranks first:** It is near-exclusively fatal (100% task death). If a trace has both FM-2.4 and FM-2.6, Information Withholding is treated as the root cause.
+- **Why FM-2.3 ranks above FM-2.6:** Task Derailment is macroscopic goal abandonment across consecutive turns. When an FM-2.6 mismatch cascades into full derailment, the trace is assigned to FM-2.3.
+
+### 2.6 FM-2.6 Reduction (610 → 363)
+
+Two principles account for the 247 removed FM-2.6 traces:
+
+- **Multi-label co-occurrence (182 traces):** Traces containing FM-2.6 that were also labeled FM-2.3 or FM-2.4 were assigned to their primary upstream failure mode to prevent double-counting.
+- **Confounding noise elimination (65 traces):** Traces exhibiting FM-2.6 alongside catastrophic FC1 infrastructure failures (unhandled Python exceptions, API timeouts, environment resets) were pruned. MARC monitors natural-language coordination decay, and evaluating a semantic monitor on a trace where the server disconnected introduces confounds.
+
+```text
+610 (raw FM-2.6) − 182 (co-occurrence with FM-2.3/2.4) − 65 (FC1 noise) = 363 (pure FM-2.6)
+
+405 (Clean) + 24 (FM-2.4) + 333 (FM-2.3) + 363 (FM-2.6) = 1,125 traces
+```
+
 ---
 
 ## 3. Trace-Level Partitioning (80/10/10)
 
-To prevent data leakage, the 1,125 filtered traces were partitioned strictly at the **trace ID level**: each full dialogue is assigned to exactly one partition, avoiding cross-turn contamination.
+To prevent data leakage, the 1,125 filtered traces were partitioned strictly at the **trace ID level**: each full dialogue is assigned to exactly one partition, avoiding cross-turn contamination. Splits are also **stratified**, so each partition preserves the ratio of clean controls to failure modes. Because 10% of 1,125 is 112.5, the dev and test sets are rounded to 112 and 113.
 
 | Split | Share | Traces | Purpose |
 |---|---:|---:|---|
-| Train | 80% | 900 | Baseline characterization and error signature discovery |
+| Train | 80% | 900 | Baseline characterization, error signature discovery, and prompt calibration |
 | Dev | 10% | 112 | Hyperparameter calibration (thresholds θ<sub>2.3</sub>, θ<sub>2.4</sub>, θ<sub>2.6</sub>) |
 | Test | 10% | 113 | Strictly held-out partition, used only for final reported metrics |
 
@@ -85,13 +149,13 @@ Filtered Corpus (1,125 traces)
 
 ### 4.1 Construct Validity and Circularity Mitigation
 
-MAST-Data labels were generated by an automated o1 LLM judge (Cohen's κ = 0.77 against human consensus). Evaluating an LLM-based monitor against LLM-generated labels therefore risks shared-model bias. To break this circularity, a 64-trace gold standard was curated for manual re-annotation by the author:
+The raw MAST-Data corpus is a "silver standard": its initial 150-trace taxonomy was human-validated (Cohen's κ = 0.88), but the scaled corpus was labeled by an automated o1 LLM judge (Cohen's κ = 0.77 against human consensus). Evaluating an LLM-based monitor against LLM-generated labels therefore risks shared-model bias, since high agreement could reflect shared model alignment rather than real detection accuracy. To break this circularity, a 64-trace gold standard was curated for manual re-annotation by the author:
 
 | Stratum | Sampling Method | Traces |
 |---|---|---:|
 | FM-2.4 | Exhaustive (all available, due to high fatality and scarcity) | 24 |
-| FM-2.3 | Stratified random | 20 |
-| FM-2.6 | Stratified random | 20 |
+| FM-2.3 | Stratified random, across diverse task benchmarks (math, coding, general reasoning) | 20 |
+| FM-2.6 | Stratified random, across diverse agent frameworks (AutoGen, ChatDev, MetaGPT) | 20 |
 | **Total** | | **64** |
 
 ### 4.2 Annotation Workbook (`marc_gold_standard_review.csv`)
@@ -102,7 +166,7 @@ The CSV exposes trace previews alongside three human-entry columns:
 |---|---|
 | `human_verified_label` | Binary confirmation (`Yes` / `No`) that the failure exists |
 | `human_onset_turn_t` | Turn index *t* at which coordination decay becomes human-legible |
-| `human_notes` | Qualitative observations about agent behavior |
+| `human_notes` | Qualitative observations about why the agent broke coordination |
 
 This audit provides the ground truth for computing Cohen's Kappa (κ<sub>h</sub>) and the Detection Offset:
 
@@ -153,7 +217,7 @@ The universal trace parser normalizes conversational handoffs across all seven u
 | Framework | Traces in Filtered Set | Raw Storage Format | Parser Engine |
 |---|---:|---|---|
 | AG2 (AutoGen) | 428 | Python dictionary sequence | Abstract Syntax Tree (`ast.literal_eval`) |
-| MetaGPT | 291 | Structured console logs | Regex role demarcation |
+| MetaGPT | 291 | Structured console logs | Regex role demarcation (`[Speaker]:`) |
 | ChatDev | 215 | Terminal dialogue dumps | Chat-chain phase extractor |
 | Magentic-One | 134 | Orchestrator event streams | JSON-RPC / telemetry parser |
 | OpenManus / AppWorld / HyperAgent | 57 | Action replay buffers | Fallback text block tokenizer |
@@ -186,22 +250,45 @@ python scripts/preprocess_mast_data.py \
 python -c "
 import pandas as pd
 df = pd.read_json('./data/marc_thesis_dataset.jsonl', lines=True)
-print(df['dataset_split'].value_counts())
+print('Total Traces:', len(df))
+print('\nSplit Breakdown:\n', df['dataset_split'].value_counts())
+print('\nTarget Mode Breakdown:\n', df['target_failure_modes'].value_counts())
 "
 ```
 
 Expected output:
 
 ```text
+Total Traces: 1125
+
+Split Breakdown:
 train    900
 test     113
 dev      112
 Name: dataset_split, dtype: int64
+
+Target Mode Breakdown:
+[Clean]     405
+[FM-2.6]    363
+[FM-2.3]    333
+[FM-2.4]     24
+Name: target_failure_modes, dtype: int64
 ```
 
 ---
 
-## 8. Citation
+## 8. Terminology Glossary
+
+- **Multi-Label Co-occurrence:** Multiple distinct failure modes present in a single execution trace.
+- **Mutually Exclusive Categorization:** Assigning each trace to exactly one primary category via a causal hierarchy, eliminating double-counting.
+- **Confounding Noise:** Irrelevant failures (network drops, hardware timeouts) that obscure agent reasoning and are filtered out.
+- **Silver-Standard Ground Truth:** High-volume annotations from a calibrated automated LLM judge (κ = 0.77).
+- **Gold-Standard Ground Truth:** High-fidelity annotations manually verified by a human expert.
+- **Exhaustive Sampling:** Selecting 100% of available instances of a rare class rather than a probabilistic sample.
+
+---
+
+## 9. Citation
 
 If you use the underlying corpus, please cite the MAST paper:
 
